@@ -1,0 +1,36 @@
+:root {
+  --bg: #0b0d10;
+  --fg: #e5e7eb;
+  --accent: #8b5cf6;
+  --ui-font: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  --editor-font:
+    ui-serif, Iowan Old Style, Palatino, Palatino Linotype, Garamond, Georgia, serif;
+
+  font: 16px/1.45 var(--ui-font);
+  color: var(--fg);
+  background: var(--bg);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--accent), transparent 65%);
+}
+
