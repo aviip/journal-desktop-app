@@ -13,6 +13,27 @@ A fullscreen, distraction-free journaling app inspired by Freewrite.
 - `npm run build`
 - `npm run lint`
 
+## Distribute (installers)
+
+Build installers for your current OS:
+
+- `npm run dist`
+
+Or per-platform (must be run on that OS):
+
+- Windows: `npm run dist:win`
+- macOS: `npm run dist:mac`
+- Linux: `npm run dist:linux`
+
+Output goes to `release/`.
+
+### GitHub Releases (recommended)
+
+This repo includes a GitHub Actions workflow that builds Windows/macOS/Linux installers when you push a tag like `v1.0.0`.
+
+- `git tag v1.0.0`
+- `git push origin v1.0.0`
+
 ## Shortcuts
 
 - `F11` or `Ctrl/⌘+Enter`: toggle fullscreen

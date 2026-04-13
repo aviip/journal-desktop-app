@@ -1,3 +1,26 @@
 {
-    
+  "appId": "com.aviip.journaldesktopapp",
+  "productName": "Journal Desktop App",
+  "asar": true,
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist-electron/**",
+    "dist-react/**",
+    "package.json",
+    "!server/**",
+    "!**/*.map"
+  ],
+  "mac": {
+    "target": ["dmg"],
+    "category": "public.app-category.productivity"
+  },
+  "win": {
+    "target": ["nsis"]
+  },
+  "linux": {
+    "target": ["AppImage"],
+    "category": "Office"
+  }
 }
