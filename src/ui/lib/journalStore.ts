@@ -3,6 +3,14 @@ export type JournalEntry = {
   createdAt: number;
   updatedAt: number;
   text: string;
+  video?: JournalVideo;
+};
+
+export type JournalVideo = {
+  blobId: string;
+  mimeType: string;
+  size: number;
+  durationMs: number;
 };
 
 export type JournalState = {
@@ -33,11 +41,10 @@ export function createEntry(now = Date.now()): JournalEntry {
 export function loadJournalState(): JournalState {
   const raw = localStorage.getItem(STORAGE_KEY);
   const parsed = raw ? safeJsonParse<JournalState>(raw) : null;
-  console.log("🚀 ~ loadJournalState ~ parsed:", parsed)
 
   const nonEmptyEntries =
-    parsed?.entries.filter((e) => e.text.trim() !== "") ?? [];
-  console.log("🚀 ~ loadJournalState ~ nonEmptyEntries:", nonEmptyEntries);
+    parsed?.entries.filter((e) => e.text.trim() !== "" || !!e.video?.blobId) ??
+    [];
 
   if (
     parsed &&
@@ -45,7 +52,7 @@ export function loadJournalState(): JournalState {
     typeof parsed.activeId === "string"
   ) {
     const activeExists = nonEmptyEntries.some((e) => e.id === parsed.activeId);
-    if (activeExists) return parsed;
+    if (activeExists) return { ...parsed, entries: nonEmptyEntries };
   }
 
   const entry = createEntry();

@@ -8,11 +8,14 @@ import {
   upsertEntry,
   type JournalEntry,
 } from "./lib/journalStore";
+import { getVideoBlob, putVideoBlob } from "./lib/videoStore";
 import { createExportOrder, verifyPayment } from "./lib/paymentsClient";
 import { openRazorpayCheckout } from "./lib/razorpay";
 
 type SaveStatus = "saved" | "saving" | "error";
 type PayStatus = "idle" | "starting" | "verifying" | "error";
+
+const MAX_VIDEO_MS = 60_000;
 
 const PLACEHOLDERS = [
   "Begin writing…",
@@ -37,6 +40,13 @@ function preview(text: string): string {
   const singleLine = text.replace(/\s+/g, " ").trim();
   if (!singleLine) return "Empty entry";
   return singleLine.length > 44 ? `${singleLine.slice(0, 44)}…` : singleLine;
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 const EXPORT_UNLOCK_KEY = "journal.exportsUnlocked.v1";
@@ -67,6 +77,11 @@ export default function App() {
   const [showChrome, setShowChrome] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [recordingMs, setRecordingMs] = useState(0);
+  const [recordError, setRecordError] = useState<string | null>(null);
+  const [activeVideoUrl, setActiveVideoUrl] = useState<string | null>(null);
+  const [activeVideoLoading, setActiveVideoLoading] = useState(false);
   const [exportsUnlocked, setExportsUnlocked] = useState(() => {
     try {
       return localStorage.getItem(EXPORT_UNLOCK_KEY) === "1";
@@ -80,7 +95,14 @@ export default function App() {
   const [payError, setPayError] = useState<string | null>(null);
 
   const editorRef = useRef<HTMLTextAreaElement | null>(null);
+  const cameraRef = useRef<HTMLVideoElement | null>(null);
   const chromeTimeoutRef = useRef<number | null>(null);
+  const recordTimerRef = useRef<number | null>(null);
+  const recordStopTimeoutRef = useRef<number | null>(null);
+  const recordStartMsRef = useRef<number>(0);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
 
   const placeholder = useMemo(
     () => PLACEHOLDERS[activeEntry.id.charCodeAt(0) % PLACEHOLDERS.length],
@@ -97,7 +119,9 @@ export default function App() {
 
   const newEntry = useCallback(() => {
     setState((prev) => {
-      const existingEmpty = prev.entries.find((e) => !e.text.trim());
+      const existingEmpty = prev.entries.find(
+        (e) => !e.text.trim() && !e.video?.blobId,
+      );
       if (existingEmpty) {
         return { ...prev, activeId: existingEmpty.id };
       }
@@ -119,6 +143,154 @@ export default function App() {
     },
     [setChromeTemporarily],
   );
+
+  const startVideoCapture = useCallback(async () => {
+    setChromeTemporarily();
+    setRecordError(null);
+
+    if (recording) return;
+    if (typeof MediaRecorder === "undefined") {
+      setRecordError("Video recording is not supported on this device.");
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setRecordError("Camera access is not available on this device.");
+      return;
+    }
+
+    const now = Date.now();
+    const hasContent = activeEntry.text.trim() !== "" || !!activeEntry.video?.blobId;
+
+    let entryId = activeEntry.id;
+    if (hasContent) {
+      const entry = createEntry(now);
+      entryId = entry.id;
+      setSaveStatus("saving");
+      setState((prev) => ({ entries: [entry, ...prev.entries], activeId: entry.id }));
+    }
+
+    const cleanup = () => {
+      if (recordTimerRef.current) window.clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+      if (recordStopTimeoutRef.current) window.clearTimeout(recordStopTimeoutRef.current);
+      recordStopTimeoutRef.current = null;
+
+      const stream = streamRef.current;
+      if (stream) {
+        for (const t of stream.getTracks()) t.stop();
+      }
+      streamRef.current = null;
+
+      if (cameraRef.current) cameraRef.current.srcObject = null;
+      recorderRef.current = null;
+      chunksRef.current = [];
+    };
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: true,
+      });
+      streamRef.current = stream;
+
+      if (cameraRef.current) {
+        cameraRef.current.srcObject = stream;
+        cameraRef.current.muted = true;
+        cameraRef.current.playsInline = true;
+        await cameraRef.current.play().catch(() => {});
+      }
+
+      const pickMimeType = (): string | undefined => {
+        const candidates = [
+          "video/webm;codecs=vp9,opus",
+          "video/webm;codecs=vp8,opus",
+          "video/webm",
+        ];
+        return candidates.find((t) => MediaRecorder.isTypeSupported(t));
+      };
+
+      const mimeType = pickMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        try {
+          const blob = new Blob(chunksRef.current, {
+            type: recorder.mimeType || "video/webm",
+          });
+          const durationMs = Math.min(MAX_VIDEO_MS, Date.now() - recordStartMsRef.current);
+          const blobId = await putVideoBlob(blob);
+
+          const updatedAt = Date.now();
+          setSaveStatus("saving");
+          setState((prev) => {
+            const existing =
+              prev.entries.find((e) => e.id === entryId) ??
+              ({ id: entryId, createdAt: updatedAt, updatedAt, text: "" } satisfies JournalEntry);
+
+            const updated: JournalEntry = {
+              ...existing,
+              updatedAt,
+              video: {
+                blobId,
+                mimeType: blob.type || recorder.mimeType || "video/webm",
+                size: blob.size,
+                durationMs,
+              },
+            };
+            return upsertEntry(prev, updated);
+          });
+        } catch (e) {
+          setRecordError(e instanceof Error ? e.message : "Failed to save video.");
+        } finally {
+          cleanup();
+          setRecording(false);
+        }
+      };
+
+      recordStartMsRef.current = Date.now();
+      setRecordingMs(0);
+      setRecording(true);
+      recorder.start();
+
+      recordTimerRef.current = window.setInterval(() => {
+        setRecordingMs(Date.now() - recordStartMsRef.current);
+      }, 200);
+
+      recordStopTimeoutRef.current = window.setTimeout(() => {
+        try {
+          recorderRef.current?.stop();
+        } catch {
+          // ignore
+        }
+      }, MAX_VIDEO_MS);
+    } catch (e) {
+      cleanup();
+      setRecording(false);
+      setRecordError(e instanceof Error ? e.message : "Camera permission was denied.");
+    }
+  }, [
+    activeEntry.id,
+    activeEntry.text,
+    activeEntry.video?.blobId,
+    recording,
+    setChromeTemporarily,
+  ]);
+
+  const stopVideoCapture = useCallback(() => {
+    setChromeTemporarily();
+    try {
+      recorderRef.current?.stop();
+    } catch {
+      // ignore
+    }
+  }, [setChromeTemporarily]);
 
   const onChangeText = useCallback((value: string) => {
     setSaveStatus("saving");
@@ -323,8 +495,79 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [state]);
 
+  useEffect(() => {
+    return () => {
+      try {
+        recorderRef.current?.stop();
+      } catch {
+        // ignore
+      }
+      if (recordTimerRef.current) window.clearInterval(recordTimerRef.current);
+      if (recordStopTimeoutRef.current) window.clearTimeout(recordStopTimeoutRef.current);
+      const stream = streamRef.current;
+      if (stream) {
+        for (const t of stream.getTracks()) t.stop();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (activeVideoUrl) URL.revokeObjectURL(activeVideoUrl);
+    };
+  }, [activeVideoUrl]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const blobId = activeEntry.video?.blobId;
+
+    if (!blobId) {
+      setActiveVideoLoading(false);
+      setActiveVideoUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      return;
+    }
+
+    setActiveVideoLoading(true);
+    getVideoBlob(blobId)
+      .then((blob) => {
+        if (cancelled) return;
+        if (!blob) throw new Error("Video not found in local storage.");
+        const url = URL.createObjectURL(blob);
+        setActiveVideoUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return url;
+        });
+      })
+      .catch((e) => {
+        if (!cancelled)
+          setRecordError(e instanceof Error ? e.message : "Failed to load video.");
+      })
+      .finally(() => {
+        if (!cancelled) setActiveVideoLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeEntry.video?.blobId]);
+
   const statusText =
     saveStatus === "saving" ? "Saving…" : saveStatus === "error" ? "Save failed" : "Saved";
+
+  const entryPreviewText = useCallback((e: JournalEntry) => {
+    if (e.video?.blobId) {
+      const d = formatDuration(e.video.durationMs);
+      return e.text.trim() ? `Video ${d} — ${preview(e.text)}` : `Video ${d}`;
+    }
+    return preview(e.text);
+  }, []);
+
+  const bottomRightText = activeEntry.video?.blobId
+    ? `${wordCount(activeEntry.text)} words • ${formatDuration(activeEntry.video.durationMs)} video`
+    : `${wordCount(activeEntry.text)} words`;
 
   return (
     <div className="app">
@@ -410,7 +653,7 @@ export default function App() {
               title={new Date(e.updatedAt).toLocaleString()}
             >
               <div className="entryMeta">{formatDay(e.updatedAt)}</div>
-              <div className="entryPreview">{preview(e.text)}</div>
+              <div className="entryPreview">{entryPreviewText(e)}</div>
             </button>
           ))}
         </div>
@@ -434,6 +677,15 @@ export default function App() {
               title="New entry (Ctrl/⌘+N)"
             >
               New
+            </button>
+            <button
+              className="ghostButton"
+              type="button"
+              onClick={startVideoCapture}
+              disabled={recording}
+              title="Record video (stored locally on this device)"
+            >
+              {recording ? "Recording…" : "Record"}
             </button>
           </div>
 
@@ -459,9 +711,57 @@ export default function App() {
           </div>
         </div>
 
+        {recording || activeEntry.video?.blobId || recordError ? (
+          <div className={`videoPanel ${recording ? "recording" : ""}`}>
+            <div className="videoPanelHeader">
+              <div className="videoPanelTitle">
+                {recording
+                  ? "Recording video"
+                  : recordError && !activeEntry.video?.blobId
+                    ? "Video capture"
+                    : "Video entry"}
+              </div>
+              <div className="videoPanelActions">
+                {recording ? (
+                  <button className="primaryButton" type="button" onClick={stopVideoCapture}>
+                    Stop
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="videoFrame">
+              {recording ? (
+                <video ref={cameraRef} className="videoEl" />
+              ) : activeVideoUrl ? (
+                <video className="videoEl" src={activeVideoUrl} controls playsInline />
+              ) : (
+                <div className="videoLoading">
+                  {activeVideoLoading ? "Loading video…" : "Video unavailable"}
+                </div>
+              )}
+              <div className="videoOverlay">
+                {recording ? (
+                  <div className="videoTimer">
+                    {formatDuration(recordingMs)} / {formatDuration(MAX_VIDEO_MS)}
+                  </div>
+                ) : activeEntry.video ? (
+                  <div className="videoTimer">
+                    {formatDuration(activeEntry.video.durationMs)} • Stored locally
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            {recordError ? <div className="videoError">{recordError}</div> : null}
+          </div>
+        ) : null}
+
         <textarea
           ref={editorRef}
-          className="editor"
+          className={`editor ${
+            recording || activeEntry.video?.blobId || recordError ? "withVideo" : ""
+          }`}
           value={activeEntry.text}
           onChange={(e) => onChangeText(e.target.value)}
           placeholder={placeholder}
@@ -471,7 +771,7 @@ export default function App() {
 
         <div className={`chrome bottom ${showChrome ? "show" : ""}`}>
           <div className="bottomLeft">{formatDay(activeEntry.createdAt)}</div>
-          <div className="bottomRight">{wordCount(activeEntry.text)} words</div>
+          <div className="bottomRight">{bottomRightText}</div>
         </div>
       </main>
     </div>
